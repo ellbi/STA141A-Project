@@ -1,0 +1,679 @@
+---
+title: "Predictive Modeling of Neural Activity in Mice"
+author: "Ellie Bi"
+date: "2024-03-14"
+output: html_document
+---
+
+# Data Pre-Processing
+
+```{r, warning = FALSE}
+library(tidyverse)
+library(stats)
+library(Rtsne)
+library(ROCR)
+library(pROC)
+library(caret)
+library(xgboost)
+library(class)
+library(e1071)
+library(randomForest)
+library(nnet)
+library(MASS)
+```
+
+```{r, warning = FALSE}
+setwd("C:/Users/ellie/OneDrive/Documents/rstudio/sta141a/STA141 Project/sessions")
+
+session <- list()
+for (i in 1:18) {
+  session[[i]] <- readRDS(paste0("session", i, ".rds"))
+}
+```
+
+```{r}
+dataproc <- function(id) {
+  trials <- lapply(1:length(session[[id]]$spks), function(trial) {
+    spk <- session[[id]]$spks[[trial]]
+    spkavg <- matrix(colMeans(spk), nrow = 1)
+    colnames(spkavg) <- paste0("bin ", 1:40)
+    ba <- session[[id]]$brain_area[which.max(rowMeans(spk))]
+    name <- session[[id]]$mouse_name
+    
+    data.frame(
+      SESSID = as.factor(id),
+      TRIALID = trial,
+      contrast_left = session[[id]]$contrast_left[trial],
+      contrast_right = session[[id]]$contrast_right[trial],
+      feedback_type = session[[id]]$feedback_type[trial],
+      name,
+      ba,
+      spkavg
+    )
+  })
+  do.call(rbind, trials)
+}
+
+totdat <- do.call(rbind, lapply(1:18, dataproc)) # categorical
+sesdat <- totdat[, -c(6, 7)] # numerical
+```
+
+```{r}
+dat <- sesdat[, 6:45]
+```
+
+
+```{r}
+head(totdat)
+```
+
+# Exploratory Data Analysis
+
+#### Number of Trials
+
+```{r}
+num_trials <- sapply(session, function(s) length(s$feedback_type))
+
+for (i in 1:length(num_trials)) {
+  cat("Session", i, ":", num_trials[i], "Trials\n")
+}
+```
+
+### Brain Area
+
+#### Unique Brain Area Names
+
+```{r}
+cat("Unique Brain Area Names:\n"); unique(unlist(lapply(session, function(s) unique(s$brain_area))))
+```
+
+#### Unique Brain Area Names for Brain Areas that had Most Neural Activity in Each Trial
+
+```{r}
+cat("Unique Brain Area Names:\n", unique(totdat$ba))
+```
+
+#### Unique Brain Areas per Session
+
+```{r}
+un_ba <- sapply(session, function(s) length(unique(s$brain_area)))
+
+for (i in 1:length(un_ba)) {
+  cat("Session", i, ":", un_ba[i], "Unique Brain Areas \n")
+}
+```
+
+```{r}
+plt <- data.frame(session = integer(), brain_area = character())
+
+for (i in 1:length(session)) {
+  ses <- session[[i]]
+  unique_areas <- unique(ses$brain_area)
+  
+  plt <- rbind(plt, expand.grid(session = i, brain_area = unique_areas))
+}
+
+ggplot(plt, aes(x = as.factor(session), y = brain_area)) +
+  geom_point() +
+  labs(title = "Brain Areas in Each Session",
+       x = "Session",
+       y = "Brain Area") +
+  theme_minimal()
+```
+
+#### Brain Area Frequency for Brain Areas that had Most Neural Activity in Each Trial
+
+```{r}
+batab <- table(totdat$ba)
+badf <- as.data.frame(batab)
+badf <- badf[order(badf$Freq, decreasing = TRUE), ] 
+
+ggplot(badf, aes(x = reorder(Var1, Freq), y = Freq)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Brain Area Frequencies", x = "Brain Area", y = "Frequency") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  coord_flip()  
+```
+
+### Neural Activity
+
+#### Neural Activity Across Sessions
+
+```{r cache = TRUE}
+plot(1, type = "n", 
+     xlab = 'Time', 
+     ylab = 'Neural Activity (spks)', 
+     main = 'Nueral Activity Across Sessions', 
+     xlim = c(1, 40),  
+     ylim = c(1, 20000))
+
+for (i in seq_along(session)) {
+  ses <- session[[i]]
+  tot_spks <- Reduce('+', ses$spks)
+  lines(1:40, colSums(tot_spks), col = rainbow(length(session))[i])
+}
+
+legend("topright", 
+       legend = paste("Session", 1:length(session)), 
+       col = rainbow(length(session)), 
+       lty = 1, 
+       cex = 0.4)
+```
+
+```{r}
+plot(colMeans(dat), type = "l", xlab = "Time Bin", ylab = "Average Spike Rate",
+     main = "Average Spike Rate Over Time Bins")
+```
+
+
+#### Average Spike Rate Across Trials
+
+```{r warning = FALSE}
+avgspk <- sesdat %>%
+  summarise(avgspks = rowSums(sesdat[, 6:45]) / 40)
+
+avgspk$SESSID <- sesdat$SESSID
+avgspk$TRIALID <- sesdat$TRIALID
+avgspk$ba <- totdat$ba
+avgspk$name <- totdat$name
+```
+
+```{r}
+ggplot(avgspk, aes(x = TRIALID, y = avgspks)) + 
+  geom_line() +
+  geom_smooth(method = "loess") +
+  facet_wrap(~SESSID, ncol = 6, nrow = 3) + 
+  labs(
+    title = "Average Spike Rate Across Trials for Each Session",  
+    x = "Session",                                                
+    y = "Average Spike Rate"                                   
+  ) +                                              
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+#### Average Spike Rate for Each Brain Area
+
+```{r warning = FALSE}
+ggplot(avgspk, aes(x = TRIALID, y = avgspks)) + 
+  geom_line() +
+  geom_smooth(method = "loess") +
+  facet_wrap(~ ba) + 
+  labs(
+    title = "Average Spike Rate Across Brain Area",  
+    x = "Brain Area",                                                
+    y = "Average Spike Rate"                                   
+  ) 
+```
+
+#### Average Spike Rate for Each Mice
+
+```{r}
+ggplot(avgspk, aes(x = TRIALID, y = avgspks)) + 
+  geom_line() +
+  geom_smooth(method = "loess") +
+  facet_wrap(~ name) + 
+  labs(
+    title = "Average Spike Rate Across Mice",  
+    x = "Mice",                                                
+    y = "Average Spike Rate"                                   
+  ) 
+```
+
+### Contrast Difference
+
+#### Percentage of Contrast Differences for Each Mice
+
+```{r}
+totdat$contrast_diff <- abs(totdat$contrast_left - totdat$contrast_right)
+
+counts.df <- totdat[c('name', 'contrast_diff')]
+counts.df$contrast_diff <- as.factor(counts.df$contrast_diff)
+counts <- table(counts.df)
+
+(percentages <- prop.table(counts, margin = 1))
+```
+
+#### Success Rate Correlated with Contrast Differences
+
+```{r}
+totdat %>% group_by(contrast_diff) %>% summarize(success = mean(feedback_type == 1, na.rm = TRUE))
+```
+
+### Success Rate
+
+```{r}
+feedback <- table(unlist(lapply(session, function(s) s$feedback_type)))
+
+for (i in 1:length(feedback)) {
+  label <- ifelse(i == 1, "Failure", "Success")
+  cat("Feedback Type", i, ":", label, "-", feedback[i], "Occurrences\n")
+}
+```
+
+```{r}
+totdat$tgr = cut(totdat$TRIALID, breaks = seq(0, max(totdat$TRIALID), by = 25),include.lowest = TRUE)
+levels(totdat$tgr) <- seq(0, max(totdat$TRIALID), by = 25)[2:18]
+totdat$success <- as.numeric(totdat$feedback_type == 1)
+```
+
+#### Success Rate of Change over Each Session
+
+```{r}
+success <- aggregate(success ~ SESSID + tgr, data = totdat, FUN = function(x) mean(x))
+
+ggplot(success, aes(x = tgr, y = success)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~SESSID, ncol = 3) +
+  theme_bw()
+```
+
+#### Success Rate of Change over Brain Area
+
+```{r}
+success <- aggregate(success ~ ba + tgr, data = totdat, FUN = function(x) mean(x))
+
+ggplot(success, aes(x = tgr, y = success)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ ba) +
+      theme_bw()
+```
+
+#### Success Rate of Change over Each Mice
+
+```{r}
+success <- aggregate(success ~ name + tgr, data = totdat, FUN = function(x) mean(x))
+
+ggplot(success, aes(x = tgr, y = success)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ name) +
+      theme_bw()
+```
+
+# Clustering
+
+```{r}
+dat <- sesdat[, 6:45]
+```
+
+
+### PCA 
+
+```{r}
+pca <- prcomp(dat)
+
+pca.df <- as.data.frame(pca$x)
+pca.df$SESSID <- totdat$SESSID
+pca.df$ba <- totdat$ba
+pca.df$name <- totdat$name
+```
+
+#### PCA Plot for Session
+
+```{r}
+ggplot(pca.df, aes(x = PC1, y = PC2, color = SESSID)) +
+  geom_point() +
+  labs(title = "PCA: PC1 vs PC2")
+```
+
+#### PCA Plot for Brain Area
+
+```{r}
+ggplot(pca.df, aes(x = PC1, y = PC2, color = ba)) +
+  geom_point() +
+  labs(title = "PCA: PC1 vs PC2")
+```
+
+#### PCA Plot for Mice
+
+```{r}
+ggplot(pca.df, aes(x = PC1, y = PC2, color = name)) +
+  geom_point() +
+  labs(title = "PCA: PC1 vs PC2")
+```
+
+### t-SNE
+
+```{r}
+tsne <- Rtsne::Rtsne(dat)
+plot(tsne$Y, col = "blue")
+```
+
+# Data Integration
+
+### Unscaled Total Train & Test
+
+```{r}
+set.seed(825)
+idx <- sample(seq_len(nrow(sesdat)), 0.8 * nrow(sesdat))
+train <- sesdat[idx, ]
+test <- sesdat[-idx, ]
+```
+
+```{r}
+traindat <- train[, -c(1, 2)]
+testdat <- test[, -c(1, 2)]
+```
+
+### Unscaled First 20 Bins Train & Test
+
+```{r}
+f.traindat <- traindat[, -c(24:43)]
+f.testdat <- testdat[, -c(24:43)]
+```
+
+### Unscaled Last 20 Bins Train & Test
+
+```{r}
+l.traindat <- traindat[, -c(4:23)]
+l.testdat <- testdat[, -c(4:23)]
+```
+
+### Scaled Total Train & Test
+
+```{r}
+s.traindat <- train[, -c(1, 2)]
+s.testdat <- test[, -c(1, 2)]
+
+s.traindat[, c(4:43)] <- scale(s.traindat[, c(4:43)])
+s.testdat[, c(4:43)] <- scale(s.testdat[, c(4:43)])
+```
+
+### Scaled First 20 Bins Train & Test
+
+```{r}
+s.f.traindat <- s.traindat[, -c(24:43)]
+s.f.testdat <- s.testdat[, -c(24:43)]
+```
+
+### Scaled Last 20 Bins Train & Test
+
+```{r}
+s.l.traindat <- s.traindat[, -c(4:23)]
+s.l.testdat <- s.testdat[, -c(4:23)]
+```
+
+### Formulas:
+
+#### F1 Score
+
+```{r}
+f1 <- function(confmat) {
+  TP <- confmat[2, 2]
+  FP <- confmat[1, 2]
+  FN <- confmat[2, 1]
+  
+  precision <- TP / (TP + FP)
+  recall <- TP / (TP + FN)
+  
+  f1_score <- 2 * precision * recall / (precision + recall)
+  
+  return(f1_score)
+}
+```
+
+# Model Building
+
+### XGBoost
+
+```{r}
+xgb <- function(train, test) {
+  # model building
+  xgbtrain <- ifelse(train$feedback_type == 1, 1, 0)
+  
+  xgbmat <- xgb.DMatrix(data = as.matrix(train[, -which(names(train) %in% c("feedback_type"))]), 
+                       label = xgbtrain)
+
+  xgbmodel <- xgboost(data = xgbmat, 
+                      objective = 'binary:logistic', 
+                      eval_metric = 'error',
+                      nrounds = 10)
+  
+  # predictions
+  xgbpred <- predict(xgbmodel, as.matrix(test[, -which(names(test) %in% c("feedback_type"))]))
+  binary <- ifelse(xgbpred > 0.5, 1, -1)
+  
+  # data
+  cat('\nFive Number Summary of Predictions\n')
+  print(summary(binary))
+  
+  # confusion matrix
+  xgb.confmat <- table(Actual = test$feedback_type, Predicted = binary)
+  cat('\n Confusion Matrix\n')
+  print(xgb.confmat)
+  
+  # accuracy
+  xgb.acc <- sum(diag(xgb.confmat)) / sum(xgb.confmat)
+  cat(paste("\nAccuracy for XGBoost:", round(xgb.acc, 4), '\n'))
+  
+  # f1
+  xgb.f1 <- f1(xgb.confmat)
+  cat(paste("\nF1 Score for XGBoost:", round(xgb.f1, 4), '\n'))
+  
+  
+  # AUROC
+  auroc <- auc(roc(test$feedback_type, xgbpred))
+  cat(paste("\nArea under ROC for XGBoost:", round(auroc, 4)))
+}
+```
+
+#### XGBoost: Total Data
+
+```{r}
+xgb(traindat, testdat)
+```
+
+#### XGBoost: First Bins
+
+```{r}
+xgb(f.traindat, f.testdat)
+```
+
+#### XGBoost: Last Bins
+
+```{r}
+xgb(l.traindat, l.testdat)
+```
+
+### Random Forest
+
+```{r}
+rf <- function(train, test) {
+  # model building
+  predictors <- setdiff(names(train), "feedback_type")
+
+  rfmodel <- randomForest(
+    formula = as.formula("feedback_type ~ ."),
+    data = train,
+    ntree = 500,
+    mtry = sqrt(length(predictors)),
+    importance = TRUE
+  )
+
+  # predictions
+  rfpred <- predict(rfmodel, newdata = test[, -which(names(test) %in% c("feedback_type"))])
+  binary <- ifelse(rfpred > 0, 1, -1)
+
+  # data
+  cat('\nFive Number Summary of Predictions\n')
+  print(summary(binary))
+
+  # confusion matrix
+  rf.confmat <- table(Actual = test$feedback_type, Predicted = binary)
+  cat('\n Confusion Matrix\n')
+  print(rf.confmat)
+  
+  # accuracy
+  rf.acc <- sum(diag(rf.confmat)) / sum(rf.confmat)
+  cat(paste("\nAccuracy for Random Forest:", round(rf.acc, 4), '\n'))
+
+  # f1
+  rf.f1 <- f1(rf.confmat)
+  cat(paste("\nF1 Score for Random Forest:", round(rf.f1, 4), '\n'))
+
+  # AUROC
+  auroc <- auc(roc(test$feedback_type, rfpred))
+  cat(paste("\nArea under ROC for Random Forest:", round(auroc, 4)))
+}
+```
+
+#### Random Forest: Total Data
+
+```{r warning = FALSE}
+rf(traindat, testdat)
+```
+
+#### Random Forest: First Bins
+
+```{r warning = FALSE}
+rf(f.traindat, f.testdat)
+```
+
+#### Random Forest: Last Bins
+
+```{r warning = FALSE}
+rf(l.traindat, l.testdat)
+```
+
+### Neural Network
+
+```{r}
+nn <- function(train, test) {
+  # model building
+  nnmodel <- nnet(feedback_type ~ ., data = train, size = 5, linout = TRUE) 
+  
+  # Predictions
+  nnpred <- predict(nnmodel, newdata = test[, -which(names(test) %in% c("feedback_type"))], type = "raw")
+  binary <- ifelse(nnpred > 0, 1, -1) 
+  
+  # data
+  cat('\nFive Number Summary of Predictions\n')
+  print(summary(binary))
+  
+  # confusion matrix
+  nn.confmat <- table(Actual = test$feedback_type, Predicted = binary)
+  cat('\nConfusion Matrix\n')
+  print(nn.confmat)
+  
+  # accuracy
+  nn.acc <- sum(diag(nn.confmat)) / sum(nn.confmat)
+  cat(paste("\nAccuracy for Neural Network:", round(nn.acc, 4), '\n'))
+  
+  # F1 Score
+  nn.f1 <- f1(nn.confmat)
+  cat(paste("\nF1 Score for Neural Network:", round(nn.f1, 4), '\n'))
+  
+  # AUROC
+  auroc <- auc(roc(test$feedback_type, nnpred))
+  cat(paste("\nArea under ROC for Neural Network:", round(auroc, 4)))
+}
+```
+
+#### Neural Network: Total Data
+
+```{r}
+nn(s.traindat, s.testdat)
+```
+
+#### Neural Network: First Bins
+
+```{r warning = FALSE}
+nn(s.f.traindat, s.f.testdat)
+```
+
+#### Neural Network: Last Bins
+
+```{r warning = FALSE}
+nn(s.l.traindat, s.l.testdat)
+```
+
+## Final Chosen Model - Random Forest for Total Data
+
+# Test Data Preparation
+
+```{r}
+dataproc_test <- function(sessiondat) {
+  trials <- lapply(1:length(sessiondat$spks), function(trial) {
+    spk <- sessiondat$spks[[trial]]
+    spkavg <- matrix(colMeans(spk), nrow = 1)
+    colnames(spkavg) <- paste0("bin ", 1:40)
+    
+    data.frame(
+      contrast_left = sessiondat$contrast_left[trial],
+      contrast_right = sessiondat$contrast_right[trial],
+      feedback_type = sessiondat$feedback_type[trial],
+      spkavg
+    )
+  })
+  do.call(rbind, trials)
+}
+```
+
+```{r}
+rfp <- function(test) {
+  # model building using rf total data model
+  predictors <- setdiff(names(traindat), "feedback_type") 
+  
+  rfmodel <- randomForest(
+    formula = as.formula("feedback_type ~ ."),
+    data = traindat,
+    ntree = 500,
+    mtry = sqrt(length(predictors)),
+    importance = TRUE
+  )
+
+  # predictions
+  rfpred <- predict(rfmodel, newdata = test[, -which(names(test) %in% c("feedback_type"))])
+  binary <- ifelse(rfpred > 0, 1, -1)
+
+  # data
+  cat('\nFive Number Summary of Predictions\n')
+  print(summary(binary))
+
+  # confusion matrix
+  rf.confmat <- table(Actual = test$feedback_type, Predicted = factor(binary, levels = c(-1, 1)), exclude = NULL)
+  cat('\n Confusion Matrix\n')
+  print(rf.confmat)
+  
+  # accuracy
+  rf.acc <- sum(diag(rf.confmat)) / sum(rf.confmat)
+  cat(paste("\nAccuracy for Random Forest:", round(rf.acc, 4), '\n'))
+
+  # f1
+  rf.f1 <- f1(rf.confmat)
+  cat(paste("\nF1 Score for Random Forest:", round(rf.f1, 4), '\n'))
+
+  # AUROC
+  auroc <- auc(roc(test$feedback_type, rfpred))
+  cat(paste("\nArea under ROC for Random Forest:", round(auroc, 4)))
+}
+```
+
+# Test Data
+
+```{r warning = FALSE}
+setwd("C:/Users/ellie/OneDrive/Documents/rstudio/sta141a/STA141 Project")
+
+test1 <- readRDS("test1.rds")
+test2 <- readRDS("test2.rds")
+```
+
+```{r}
+test1dat <- dataproc_test(test1)
+test2dat <- dataproc_test(test2)
+```
+
+```{r}
+rfp(test1dat)
+```
+
+```{r}
+rfp(test2dat)
+```
+
+
+
+
+
+
+
